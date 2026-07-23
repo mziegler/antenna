@@ -458,6 +458,7 @@ def import_from_s3(
         by_deployment[(data.get("deployment_name") or "").strip()].append((key, data))
 
     projects: dict[int, Project] = {}
+    deployments: dict[int, Deployment] = {}
     for deployment_name, dep_records in by_deployment.items():
         if not deployment_name:
             logger.warning(f"Skipping {len(dep_records)} records with no deployment_name.")
@@ -468,6 +469,7 @@ def import_from_s3(
             first, data_source=source, data_source_subdir=subdir, data_source_regex=regex
         )
         projects[deployment.project_id] = deployment.project
+        deployments[deployment.pk] = deployment
         if not skip_sync:
             logger.info(f"Syncing captures for '{deployment_name}' (subdir='{subdir}') …")
             deployment.sync_captures()
@@ -481,7 +483,33 @@ def import_from_s3(
         )
         import_records(project, detector, classifier, proj_records, summary=summary)
 
+    # Recompute cached counts once, after all detections/occurrences exist. sync_captures
+    # runs before occurrences are created, so the deployment/event count fields would
+    # otherwise stay stale until the next sync. Scoped to the touched deployments (not the
+    # whole project) so a per-night incremental import doesn't re-sweep every deployment.
+    for deployment in deployments.values():
+        recompute_calculated_fields(deployment, logger=logger)
+
     return summary
+
+
+def recompute_calculated_fields(deployment: Deployment, logger: logging.Logger = logger) -> None:
+    """Recompute cached count fields for a deployment after an import.
+
+    Mirrors ``Project.update_related_calculated_fields`` but scoped to one deployment:
+    refreshes each event's counts, the deployment's own counts (events/captures/detections/
+    occurrences/taxa), and the per-image detection counts. These are the project's
+    default-filtered counts (see ``Deployment.update_calculated_fields``), so unidentified or
+    low-confidence occurrences are intentionally excluded.
+    """
+    from ami.main.models import update_detection_counts
+
+    logger.info(f"Recomputing calculated fields for deployment {deployment}")
+    for event in deployment.events.all():
+        event.update_calculated_fields(save=True)
+    deployment.update_calculated_fields(save=True)
+    if deployment.project_id:
+        update_detection_counts(qs=SourceImage.objects.filter(deployment=deployment), project=deployment.project)
 
 
 def _scan_algorithm_info(records: list[dict]) -> tuple[str, str, list[tuple[str, str]]]:

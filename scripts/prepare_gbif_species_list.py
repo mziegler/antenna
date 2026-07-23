@@ -20,7 +20,12 @@ import argparse
 import csv
 import sys
 
-RANK_COLUMNS = ["kingdom", "phylum", "class", "order", "family", "genus", "species"]
+# NOTE: 'kingdom' is intentionally excluded. Antenna's `import_taxa` hardcodes Arthropoda
+# (PHYLUM) as the root taxon with no parent. Including a rank *above* that root (kingdom =
+# Animalia) makes the importer set Animalia's parent to Arthropoda and Arthropoda's parent to
+# Animalia — a cycle — and `Taxon.update_parents()` then infinite-loops walking the parent
+# chain (no cycle guard). So the highest rank we emit is phylum (Arthropoda = the root).
+RANK_COLUMNS = ["phylum", "class", "order", "family", "genus", "species"]
 OUTPUT_COLUMNS = RANK_COLUMNS + ["gbif_taxon_key", "author"]
 
 

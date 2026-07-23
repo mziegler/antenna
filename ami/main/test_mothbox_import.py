@@ -125,6 +125,15 @@ class MothboxImportTest(TestCase):
         self.assertEqual(summary.source_images_skipped_no_capture, 1)
         self.assertEqual(Detection.objects.filter(source_image=self.source_image).count(), 0)
 
+    def test_recompute_calculated_fields_runs_and_populates_deployment_counts(self):
+        # After import + recompute, the deployment's cached count fields are populated ints
+        # (recompute delegates to Antenna's update_calculated_fields; this checks the wiring).
+        mb.import_records(self.project, self.detector, self.classifier, [_botdetection_json()])
+        mb.recompute_calculated_fields(self.deployment)
+        self.deployment.refresh_from_db()
+        for field in ("events_count", "captures_count", "detections_count", "occurrences_count", "taxa_count"):
+            self.assertIsInstance(getattr(self.deployment, field), int, field)
+
     def test_provision_deployment_from_metadata(self):
         deployment = mb.provision_deployment(_botdetection_json())
         self.assertEqual(deployment.name, "Dataset_ManuNet_RestorationNewerC_fluidRobin_2026-05-04")
