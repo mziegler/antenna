@@ -53,6 +53,15 @@ class Command(BaseCommand):
         parser.add_argument(
             "--dry-run", action="store_true", help="Parse and report counts, but roll back all writes."
         )
+        parser.add_argument(
+            "--unidentified-taxon",
+            default=mb.DEFAULT_UNIDENTIFIED_TAXON,
+            help=(
+                "Fallback taxon for detections Mothbot_Process left unclassified — a shim "
+                "classification at score 0.0 is created for each (default: Arthropoda). "
+                "Pass an empty string to leave them determination-less."
+            ),
+        )
 
     def handle(self, *args, **options):
         source = self._resolve_storage_source(options["storage_source"])
@@ -63,6 +72,7 @@ class Command(BaseCommand):
                 prefix=options["prefix"],
                 regex=options["regex"],
                 skip_sync=options["skip_sync"],
+                unidentified_taxon_name=options["unidentified_taxon"] or None,
             )
             if options["dry_run"]:
                 self.stdout.write(self.style.WARNING("Dry run — rolling back all writes."))

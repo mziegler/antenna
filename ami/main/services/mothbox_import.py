@@ -37,6 +37,7 @@ from ami.main.models import (
     Deployment,
     Detection,
     Device,
+    Occurrence,
     Project,
     S3StorageSource,
     Site,
@@ -55,6 +56,16 @@ BOTDETECTION_SUFFIX = "_botdetection.json"
 PROCESSED_SUBDIR = "_processed"
 # Label Mothbot_Process uses for a detected-but-unidentified insect (no taxonomy).
 UNIDENTIFIED_LABEL = "creature"
+
+# Fallback taxon + dedicated algorithm for the "shim" classifications attached to detections
+# that Mothbot_Process left unidentified. Everything a Mothbox catches is an arthropod, so
+# Arthropoda (phylum) is a safe, correct determination; the shim carries score 0.0 so it's
+# trivially distinguishable from real classifications and stays below any positive score
+# threshold. See get_or_create_shim_algorithm / shim classifications below.
+DEFAULT_UNIDENTIFIED_TAXON = "Arthropoda"
+SHIM_ALGORITHM_KEY = "mothbox-import-unidentified-fallback"
+SHIM_ALGORITHM_NAME = "Mothbox import — unidentified fallback"
+SHIM_SCORE = 0.0
 
 # DarwinCore rank fields present on a Mothbox shape, ordered coarse → fine.
 DWC_RANK_FIELDS: list[tuple[str, TaxonRank]] = [
@@ -77,6 +88,7 @@ class ImportSummary:
     source_images_skipped_already_imported: int = 0
     detections_created: int = 0
     classifications_created: int = 0
+    shim_classifications_created: int = 0
     occurrences_created: int = 0
     json_files_read: int = 0
 
@@ -296,23 +308,28 @@ def import_detections_for_image(
     classifier: Algorithm,
     taxon_cache: dict[tuple[str, str], Taxon],
     summary: ImportSummary,
+    unidentified_taxon: Taxon | None = None,
+    shim_algorithm: Algorithm | None = None,
 ) -> list[Detection]:
     """Create Detections (+ Classifications) for one ``_botdetection.json`` / SourceImage.
 
     Idempotent: if the image already has detections from ``detector``, it is skipped. All
     detections/classifications for the image are bulk-created; occurrences are created later.
+
+    When ``unidentified_taxon``/``shim_algorithm`` are given, detections Mothbot_Process left
+    unclassified get a **shim classification** to that taxon at score ``SHIM_SCORE`` (0.0),
+    instead of being left determination-less.
     """
     if Detection.objects.filter(source_image=source_image, detection_algorithm=detector).exists():
         summary.source_images_skipped_already_imported += 1
         return []
 
     data_source = source_image.deployment.data_source if source_image.deployment_id else None
-    shapes = data.get("shapes") or []
 
-    detections: list[Detection] = []
-    # Parallel list of the taxon (or None) each detection should be classified as.
-    detection_taxa: list[Taxon | None] = []
-    for shape in shapes:
+    # (detection, shape, resolved-taxon-or-None) for each usable shape, kept aligned so the
+    # classification pass reads the right shape (shapes with <3 points are dropped).
+    kept: list[tuple[Detection, dict, Taxon | None]] = []
+    for shape in data.get("shapes") or []:
         points = shape.get("points")
         if not points or len(points) < 3:
             continue
@@ -324,37 +341,71 @@ def import_detections_for_image(
             detection_score=shape.get("confidence_detection"),
             path=_patch_url(data_source, source_image.path, shape.get("patch_path") or ""),
         )
-        detections.append(detection)
-        # Unidentified "creature" shapes carry no taxonomy → detection only, no classification.
+        # Unidentified "creature" shapes carry no taxonomy → no real classification.
         taxon = None if (shape.get("label") == UNIDENTIFIED_LABEL) else resolve_taxon(shape, taxon_cache)
-        detection_taxa.append(taxon)
+        kept.append((detection, shape, taxon))
 
-    if not detections:
+    if not kept:
         return []
 
+    detections = [d for d, _shape, _taxon in kept]
     Detection.objects.bulk_create(detections)
     summary.detections_created += len(detections)
 
     classifications: list[Classification] = []
-    for detection, shape, taxon in zip(detections, shapes, detection_taxa):
-        if taxon is None:
-            continue
-        classifications.append(
-            Classification(
-                detection=detection,
-                taxon=taxon,
-                algorithm=classifier,
-                category_map=classifier.category_map,
-                score=shape.get("confidence_ID"),
-                timestamp=source_image.timestamp,
-                terminal=True,
+    for detection, shape, taxon in kept:
+        if taxon is not None:
+            classifications.append(
+                Classification(
+                    detection=detection,
+                    taxon=taxon,
+                    algorithm=classifier,
+                    category_map=classifier.category_map,
+                    score=shape.get("confidence_ID"),
+                    timestamp=source_image.timestamp,
+                    terminal=True,
+                )
             )
-        )
+            summary.classifications_created += 1
+        elif unidentified_taxon is not None and shim_algorithm is not None:
+            classifications.append(_build_shim_classification(detection, unidentified_taxon, shim_algorithm))
+            summary.shim_classifications_created += 1
     if classifications:
         Classification.objects.bulk_create(classifications)
-        summary.classifications_created += len(classifications)
 
     return detections
+
+
+def _build_shim_classification(
+    detection: Detection, unidentified_taxon: Taxon, shim_algorithm: Algorithm
+) -> Classification:
+    """A stand-in Classification (score ``SHIM_SCORE``) for a detection with no real ID."""
+    return Classification(
+        detection=detection,
+        taxon=unidentified_taxon,
+        algorithm=shim_algorithm,
+        category_map=shim_algorithm.category_map,
+        score=SHIM_SCORE,
+        timestamp=detection.timestamp,
+        terminal=True,
+    )
+
+
+def get_or_create_unidentified_taxon(name: str = DEFAULT_UNIDENTIFIED_TAXON) -> Taxon:
+    """The fallback taxon for unidentified detections (defaults to Arthropoda, PHYLUM)."""
+    rank = TaxonRank.PHYLUM.value if name == DEFAULT_UNIDENTIFIED_TAXON else TaxonRank.UNKNOWN.value
+    taxon, _ = Taxon.objects.get_or_create(name=name, defaults={"rank": rank})
+    return taxon
+
+
+def get_or_create_shim_algorithm() -> Algorithm:
+    """A dedicated classification Algorithm marking shim (import-fallback) classifications,
+    so they are identifiable and removable, and never confused with real classifier output."""
+    algorithm, _ = Algorithm.objects.get_or_create(
+        key=SHIM_ALGORITHM_KEY,
+        defaults={"name": SHIM_ALGORITHM_NAME, "task_type": AlgorithmTaskType.CLASSIFICATION.value},
+    )
+    return algorithm
 
 
 # --------------------------------------------------------------------------------------
@@ -366,6 +417,8 @@ def import_records(
     classifier: Algorithm,
     json_records: typing.Iterable[dict],
     summary: ImportSummary | None = None,
+    unidentified_taxon: Taxon | None = None,
+    shim_algorithm: Algorithm | None = None,
 ) -> ImportSummary:
     """Import an iterable of parsed ``_botdetection.json`` dicts into an already-synced project.
 
@@ -373,6 +426,9 @@ def import_records(
     the record's deployment) — images whose raw frame was not registered are logged and
     skipped (the "raw present only" guard). Occurrences + determinations are created at the end
     via Antenna's own bulk helper.
+
+    If ``unidentified_taxon`` is given, unclassified detections get a shim classification to it
+    (score ``SHIM_SCORE``); their occurrences are then determined as that taxon with score 0.0.
     """
     from ami.ml.models.pipeline import create_and_update_occurrences_for_detections
 
@@ -387,15 +443,100 @@ def import_records(
             summary.source_images_skipped_no_capture += 1
             continue
         summary.source_images_matched += 1
-        detections = import_detections_for_image(data, source_image, detector, classifier, taxon_cache, summary)
+        detections = import_detections_for_image(
+            data, source_image, detector, classifier, taxon_cache, summary, unidentified_taxon, shim_algorithm
+        )
         all_detections.extend(detections)
 
     if all_detections:
         create_and_update_occurrences_for_detections(all_detections, logger=logger)
         summary.occurrences_created += len(all_detections)
 
+    _fix_shim_determination_scores(project, unidentified_taxon)
+
     logger.info(f"Mothbox import summary: {summary.as_dict()}")
     return summary
+
+
+def _fix_shim_determination_scores(project: Project, unidentified_taxon: Taxon | None) -> None:
+    """Force shim occurrences' ``determination_score`` to ``SHIM_SCORE`` (0.0).
+
+    ``update_occurrence_determination`` sets the determination taxon but leaves the score
+    unset for a score-0 prediction (its ``if new_score:`` guard treats 0.0 as falsy). A NULL
+    score is excluded by the default score-threshold filter even at threshold 0, so we set it
+    explicitly to 0.0 — that way lowering the project threshold to 0 surfaces these occurrences.
+    """
+    if unidentified_taxon is None:
+        return
+    Occurrence.objects.filter(
+        project=project, determination=unidentified_taxon, determination_score__isnull=True
+    ).update(determination_score=SHIM_SCORE)
+
+
+def backfill_unidentified_classifications(
+    project: Project,
+    taxon_name: str = DEFAULT_UNIDENTIFIED_TAXON,
+    batch_size: int = 2000,
+    logger: logging.Logger = logger,
+) -> dict[str, int]:
+    """Attach shim classifications to *already-imported* detections that have no classification.
+
+    For every valid detection in ``project`` with no classification, create a shim
+    Classification to ``taxon_name`` at score 0.0, then determine each such (undetermined)
+    occurrence as that taxon with score 0.0. Idempotent — detections that already have a
+    classification are skipped — so it is safe to re-run and to run alongside new imports.
+    """
+    taxon = get_or_create_unidentified_taxon(taxon_name)
+    shim_algorithm = get_or_create_shim_algorithm()
+    taxon.projects.add(project)
+
+    det_rows = list(
+        Detection.objects.filter(source_image__project=project, bbox__isnull=False, classifications__isnull=True)
+        .order_by("pk")
+        .values_list("pk", "timestamp")
+    )
+    logger.info(f"Backfilling shim classifications for {len(det_rows)} unclassified detections in {project}")
+
+    created = 0
+    batch: list[Classification] = []
+    for pk, timestamp in det_rows:
+        batch.append(
+            Classification(
+                detection_id=pk,
+                taxon=taxon,
+                algorithm=shim_algorithm,
+                category_map=shim_algorithm.category_map,
+                score=SHIM_SCORE,
+                timestamp=timestamp,
+                terminal=True,
+            )
+        )
+        if len(batch) >= batch_size:
+            Classification.objects.bulk_create(batch)
+            created += len(batch)
+            batch = []
+    if batch:
+        Classification.objects.bulk_create(batch)
+        created += len(batch)
+
+    # Determine the (still-undetermined) occurrences those detections belong to. Each imported
+    # detection maps to exactly one occurrence, so setting determination directly is correct and
+    # avoids update_occurrence_determination's score-0 quirk.
+    occ_ids = list(
+        Occurrence.objects.filter(
+            project=project, determination__isnull=True, detections__classifications__algorithm=shim_algorithm
+        )
+        .values_list("pk", flat=True)
+        .distinct()
+    )
+    determined = 0
+    for i in range(0, len(occ_ids), batch_size):
+        determined += Occurrence.objects.filter(pk__in=occ_ids[i : i + batch_size]).update(
+            determination=taxon, determination_score=SHIM_SCORE
+        )
+
+    logger.info(f"Backfill done: {created} shim classifications, {determined} occurrences determined as {taxon}")
+    return {"shim_classifications_created": created, "occurrences_determined": determined}
 
 
 def _match_source_image(project: Project, data: dict) -> SourceImage | None:
@@ -419,6 +560,7 @@ def import_from_s3(
     prefix: str = "",
     regex: str = r"_HDR0\.jpg$",
     skip_sync: bool = False,
+    unidentified_taxon_name: str | None = DEFAULT_UNIDENTIFIED_TAXON,
     logger: logging.Logger = logger,
 ) -> ImportSummary:
     """End-to-end import of all ``*_botdetection.json`` under ``prefix`` in an S3 source.
@@ -426,8 +568,15 @@ def import_from_s3(
     Provisions the Project/Deployment from JSON metadata, registers the raw frames via each
     deployment's ``sync_captures`` (unless ``skip_sync``), sets up the detector/classifier
     Algorithms + Pipeline, and creates Detections/Classifications/Occurrences. Idempotent.
+
+    ``unidentified_taxon_name`` (default ``"Arthropoda"``) gives detections Mothbot_Process left
+    unclassified a shim classification to that taxon at score 0.0; pass ``None``/`""` to leave
+    them determination-less instead.
     """
     import ami.utils.s3 as s3
+
+    unidentified_taxon = get_or_create_unidentified_taxon(unidentified_taxon_name) if unidentified_taxon_name else None
+    shim_algorithm = get_or_create_shim_algorithm() if unidentified_taxon else None
 
     config = source.config
     # list_files_paginated yields (object_dict | None, count) tuples and defaults to filtering
@@ -481,7 +630,17 @@ def import_from_s3(
         detector, classifier, _pipeline = setup_algorithms_and_pipeline(
             project, detector_name, classifier_name, category_labels
         )
-        import_records(project, detector, classifier, proj_records, summary=summary)
+        if unidentified_taxon is not None:
+            unidentified_taxon.projects.add(project)
+        import_records(
+            project,
+            detector,
+            classifier,
+            proj_records,
+            summary=summary,
+            unidentified_taxon=unidentified_taxon,
+            shim_algorithm=shim_algorithm,
+        )
 
     # Recompute cached counts once, after all detections/occurrences exist. sync_captures
     # runs before occurrences are created, so the deployment/event count fields would

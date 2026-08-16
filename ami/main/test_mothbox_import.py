@@ -125,6 +125,45 @@ class MothboxImportTest(TestCase):
         self.assertEqual(summary.source_images_skipped_no_capture, 1)
         self.assertEqual(Detection.objects.filter(source_image=self.source_image).count(), 0)
 
+    def test_shim_classification_for_unidentified_detections(self):
+        taxon = mb.get_or_create_unidentified_taxon("Arthropoda")
+        shim = mb.get_or_create_shim_algorithm()
+        summary = mb.import_records(
+            self.project,
+            self.detector,
+            self.classifier,
+            [_botdetection_json()],
+            unidentified_taxon=taxon,
+            shim_algorithm=shim,
+        )
+        # The Diptera box gets a real classification; the "creature" box gets a shim.
+        self.assertEqual(summary.classifications_created, 1)
+        self.assertEqual(summary.shim_classifications_created, 1)
+        shim_cls = Classification.objects.filter(algorithm=shim, detection__source_image=self.source_image)
+        self.assertEqual(shim_cls.count(), 1)
+        self.assertEqual(shim_cls.get().taxon, taxon)
+        self.assertEqual(shim_cls.get().score, 0.0)
+        # The creature occurrence is now determined as Arthropoda at score 0.0 (not NULL).
+        occ = Occurrence.objects.filter(determination=taxon, detections__source_image=self.source_image).distinct()
+        self.assertEqual(occ.count(), 1)
+        self.assertEqual(occ.get().determination_score, 0.0)
+
+    def test_backfill_adds_shims_to_existing_unclassified(self):
+        # Import WITHOUT the shim (old behavior) → the creature box is left unclassified.
+        mb.import_records(self.project, self.detector, self.classifier, [_botdetection_json()])
+        self.assertTrue(
+            Detection.objects.filter(source_image=self.source_image, classifications__isnull=True).exists()
+        )
+        mb.backfill_unidentified_classifications(self.project, taxon_name="Arthropoda")
+        taxon = mb.get_or_create_unidentified_taxon("Arthropoda")
+        # No unclassified detection remains on our image, and its occurrence is now determined.
+        self.assertFalse(
+            Detection.objects.filter(source_image=self.source_image, classifications__isnull=True).exists()
+        )
+        occ = Occurrence.objects.filter(determination=taxon, detections__source_image=self.source_image).distinct()
+        self.assertEqual(occ.count(), 1)
+        self.assertEqual(occ.get().determination_score, 0.0)
+
     def test_recompute_calculated_fields_runs_and_populates_deployment_counts(self):
         # After import + recompute, the deployment's cached count fields are populated ints
         # (recompute delegates to Antenna's update_calculated_fields; this checks the wiring).
