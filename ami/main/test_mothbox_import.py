@@ -1,10 +1,21 @@
 """Tests for the Mothbox / Mothbot_Process importer (ami.main.services.mothbox_import)."""
 
 import datetime
+import io
 
 from django.test import TestCase
+from PIL import Image
 
-from ami.main.models import Classification, Detection, Occurrence, SourceImage, Taxon, TaxonRank
+from ami.main.models import (
+    Classification,
+    Detection,
+    Occurrence,
+    S3StorageSource,
+    SourceImage,
+    SourceImageCollection,
+    Taxon,
+    TaxonRank,
+)
 from ami.main.services import mothbox_import as mb
 from ami.tests.fixtures.main import setup_test_project
 
@@ -185,8 +196,63 @@ class MothboxImportTest(TestCase):
         again = mb.provision_deployment(_botdetection_json())
         self.assertEqual(again.pk, deployment.pk)
 
+    def test_reconstruct_missing_raw_creates_composite_capture(self):
+        write_source = S3StorageSource.objects.create(
+            name="recon",
+            bucket="recon-bucket",
+            access_key="",
+            secret_key="",
+            public_base_url="https://obj.example.com/recon/",
+        )
+        # dry_run=True skips the S3 build/upload but still creates the SourceImage.
+        ctx = mb.ReconstructionContext(read_config=None, write_source=write_source, dry_run=True)
+        rec = _botdetection_json()
+        rec["deployment_name"] = self.deployment.name  # so _resolve_deployment finds our deployment
+        rec["imagePath"] = "/mb/2026-05-17/RECON_2026_05_17__19_00_00_HDR0.jpg"  # no matching raw SourceImage
+        rec[
+            "_json_key"
+        ] = "manu-net-deployments/D/2026-05-17/_processed/RECON_2026_05_17__19_00_00_HDR0_botdetection.json"
+
+        summary = mb.import_records(self.project, self.detector, self.classifier, [rec], reconstruct=ctx)
+
+        self.assertEqual(summary.reconstructed_created, 1)
+        self.assertEqual(summary.source_images_matched, 0)
+        si = SourceImage.objects.get(deployment=self.deployment, path__endswith=".webp")
+        self.assertTrue(si.path.endswith("RECON_2026_05_17__19_00_00_HDR0.webp"))
+        self.assertEqual(si.public_base_url, "https://obj.example.com/recon/")
+        self.assertEqual((si.width, si.height), (9248, 6944))  # original raw dims from the JSON
+        self.assertEqual(si.timestamp, datetime.datetime(2026, 5, 17, 19, 0, 0))
+        self.assertEqual(Detection.objects.filter(source_image=si).count(), 2)
+
+        # Idempotent: re-running doesn't create a second composite capture.
+        summary2 = mb.import_records(self.project, self.detector, self.classifier, [rec], reconstruct=ctx)
+        self.assertEqual(summary2.reconstructed_created, 0)
+        self.assertEqual(SourceImage.objects.filter(deployment=self.deployment, path__endswith=".webp").count(), 1)
+
+    def test_real_captures_collection_gets_matched_captures(self):
+        mb.import_records(self.project, self.detector, self.classifier, [_botdetection_json()])
+        coll = SourceImageCollection.objects.get(project=self.project, name=mb.REAL_CAPTURES_COLLECTION_NAME)
+        self.assertEqual(coll.method, "manual")
+        self.assertIn(self.source_image, list(coll.images.all()))
+
 
 class MothboxHelpersTest(TestCase):
+    def test_reconstruct_composite_webp_produces_halfres_webp(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (60, 40), (200, 30, 30)).save(buf, "JPEG")
+        patch_bytes = buf.getvalue()
+        data = {
+            "imageWidth": 400,
+            "imageHeight": 300,
+            "shapes": [{"points": [[100, 100], [160, 100], [160, 140], [100, 140]], "patch_path": "p0.jpg"}],
+        }
+        out = mb.reconstruct_composite_webp(
+            data, "night/_processed/x.json", read_patch=lambda k: patch_bytes, scale=0.5
+        )
+        img = Image.open(io.BytesIO(out))
+        self.assertEqual(img.format, "WEBP")
+        self.assertEqual(img.size, (200, 150))  # half of 400x300; overlays use the stored originals
+
     def test_deployment_subdir_is_relative_to_source_prefix(self):
         class _Config:
             prefix = "mothbox/"

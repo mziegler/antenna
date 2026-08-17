@@ -62,9 +62,32 @@ class Command(BaseCommand):
                 "Pass an empty string to leave them determination-less."
             ),
         )
+        parser.add_argument(
+            "--reconstruct-missing-raws",
+            action="store_true",
+            help=(
+                "For JSONs whose raw frame was deleted, reconstruct a grey composite from the "
+                "patch crops (half-res WebP) and import it as a capture, instead of skipping. "
+                "Requires --reconstruct-storage-source."
+            ),
+        )
+        parser.add_argument(
+            "--reconstruct-storage-source",
+            default=None,
+            help="Name or PK of the writable S3StorageSource (dedicated bucket) for reconstructed composites.",
+        )
 
     def handle(self, *args, **options):
         source = self._resolve_storage_source(options["storage_source"])
+
+        reconstruct = None
+        if options["reconstruct_missing_raws"]:
+            if not options["reconstruct_storage_source"]:
+                raise CommandError("--reconstruct-missing-raws requires --reconstruct-storage-source.")
+            write_source = self._resolve_storage_source(options["reconstruct_storage_source"])
+            reconstruct = mb.ReconstructionContext(
+                read_config=source.config, write_source=write_source, dry_run=options["dry_run"]
+            )
 
         with transaction.atomic():
             summary = mb.import_from_s3(
@@ -73,6 +96,7 @@ class Command(BaseCommand):
                 regex=options["regex"],
                 skip_sync=options["skip_sync"],
                 unidentified_taxon_name=options["unidentified_taxon"] or None,
+                reconstruct=reconstruct,
             )
             if options["dry_run"]:
                 self.stdout.write(self.style.WARNING("Dry run — rolling back all writes."))

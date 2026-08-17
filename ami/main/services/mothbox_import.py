@@ -25,8 +25,10 @@ Key mapping decisions (see the import plan for the full rationale):
 
 import collections
 import dataclasses
+import io
 import json
 import logging
+import math
 import posixpath
 import typing
 
@@ -67,6 +69,19 @@ SHIM_ALGORITHM_KEY = "mothbox-import-unidentified-fallback"
 SHIM_ALGORITHM_NAME = "Mothbox import — unidentified fallback"
 SHIM_SCORE = 0.0
 
+# Reconstruction of captures whose raw frame was deleted: paste the (de-rotated) patch crops
+# back onto a solid-grey full-frame canvas at their oriented-box positions, and store the result
+# as a half-resolution WebP. WebP crushes the flat background, so a composite is ~1% of the raw
+# (~0.17 MB) yet shows the real insects with correctly-oriented, non-occluded patches. The
+# composite is a real image object served via the SourceImage's own ``public_base_url``, so no
+# Antenna-core/serving change is needed. See reconstruct_composite_webp / _paste_rotated_patch.
+RECONSTRUCT_WEBP_QUALITY = 80
+RECONSTRUCT_SCALE = 0.5  # half resolution
+RECONSTRUCT_BG = (128, 128, 128)  # solid grey background
+RECONSTRUCT_EXT = ".webp"
+# Capture set that lets users view only real (raw-present) captures; the importer maintains it.
+REAL_CAPTURES_COLLECTION_NAME = "Real captures (raw present)"
+
 # DarwinCore rank fields present on a Mothbox shape, ordered coarse → fine.
 DWC_RANK_FIELDS: list[tuple[str, TaxonRank]] = [
     ("kingdom", TaxonRank.KINGDOM),
@@ -86,6 +101,7 @@ class ImportSummary:
     source_images_matched: int = 0
     source_images_skipped_no_capture: int = 0
     source_images_skipped_already_imported: int = 0
+    reconstructed_created: int = 0
     detections_created: int = 0
     classifications_created: int = 0
     shim_classifications_created: int = 0
@@ -94,6 +110,22 @@ class ImportSummary:
 
     def as_dict(self) -> dict[str, int]:
         return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class ReconstructionContext:
+    """Everything the importer needs to reconstruct a deleted raw frame from its patch crops.
+
+    ``read_config`` reads the patch bytes (the read S3 source, e.g. manu-mothbox);
+    ``write_source`` is the S3StorageSource for the dedicated reconstructed bucket (write key +
+    ``public_base_url``); the composite is uploaded there and served via that base URL.
+    """
+
+    read_config: typing.Any  # ami.utils.s3.S3Config
+    write_source: S3StorageSource
+    quality: int = RECONSTRUCT_WEBP_QUALITY
+    scale: float = RECONSTRUCT_SCALE
+    dry_run: bool = False  # skip building/uploading composites (for --dry-run previews)
 
 
 # --------------------------------------------------------------------------------------
@@ -409,6 +441,144 @@ def get_or_create_shim_algorithm() -> Algorithm:
 
 
 # --------------------------------------------------------------------------------------
+# Reconstruction of deleted raw captures
+# --------------------------------------------------------------------------------------
+def _paste_rotated_patch(canvas, patch, points) -> None:
+    """Paste a de-rotated patch back onto ``canvas`` at its oriented-box position.
+
+    A Mothbox patch is stored upright; its width is the box's ``|edge12|`` side and its height
+    ``|edge01|`` (verified against the data). We resize to those side lengths, rotate by
+    ``180 - edge12_angle`` (matches the source frame — the +180 was confirmed visually), and
+    paste through the rotated image's own alpha so the transparent expand-corners never occlude
+    neighbouring patches. ``canvas``/``patch`` are PIL Images.
+    """
+    from PIL import Image
+
+    p = points
+    l01 = math.hypot(p[1][0] - p[0][0], p[1][1] - p[0][1])  # -> patch height
+    l12 = math.hypot(p[2][0] - p[1][0], p[2][1] - p[1][1])  # -> patch width
+    img = patch.resize((max(1, round(l12)), max(1, round(l01))), Image.BILINEAR).convert("RGBA")
+    angle = 180.0 - math.degrees(math.atan2(p[2][1] - p[1][1], p[2][0] - p[1][0]))
+    img = img.rotate(angle, expand=True, resample=Image.BILINEAR, fillcolor=(0, 0, 0, 0))
+    cx = sum(q[0] for q in p) / 4.0
+    cy = sum(q[1] for q in p) / 4.0
+    canvas.paste(img, (int(round(cx - img.width / 2)), int(round(cy - img.height / 2))), img)
+
+
+def reconstruct_composite_webp(
+    data: dict,
+    json_key: str,
+    read_patch: typing.Callable[[str], bytes],
+    quality: int = RECONSTRUCT_WEBP_QUALITY,
+    scale: float = RECONSTRUCT_SCALE,
+) -> bytes:
+    """Rebuild a deleted raw frame as a WebP: grey full-frame canvas + the rotated patch crops.
+
+    ``read_patch(key) -> bytes`` fetches each patch (injected for testability). Patches live in
+    the same ``_processed/`` dir as ``json_key``. The canvas is the original raw dimensions
+    (from the JSON), downscaled by ``scale`` at the end — the stored ``SourceImage.width/height``
+    stay the originals so detection overlays still line up.
+    """
+    from PIL import Image
+
+    width = int(data.get("imageWidth") or 0)
+    height = int(data.get("imageHeight") or 0)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"JSON {json_key} has no imageWidth/imageHeight; cannot reconstruct.")
+
+    canvas = Image.new("RGB", (width, height), RECONSTRUCT_BG)
+    processed_dir = posixpath.dirname(json_key)
+    for shape in data.get("shapes", []):
+        points = shape.get("points")
+        patch_path = shape.get("patch_path")
+        if not patch_path or not points or len(points) < 4:
+            continue
+        try:
+            patch = Image.open(io.BytesIO(read_patch(posixpath.join(processed_dir, patch_path)))).convert("RGB")
+        except Exception as exc:
+            logger.warning(f"Skipping unreadable patch {patch_path} for {json_key}: {exc}")
+            continue
+        _paste_rotated_patch(canvas, patch, points)
+
+    if scale and scale != 1.0:
+        canvas = canvas.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.BILINEAR)
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="WEBP", quality=quality)
+    return buffer.getvalue()
+
+
+def _raw_object_key_for_json(json_key: str, data: dict) -> str:
+    """The S3 key the (deleted) raw frame would have: its basename in the night dir above _processed/."""
+    night_dir = posixpath.dirname(posixpath.dirname(json_key))
+    basename = posixpath.basename((data.get("imagePath") or data.get("filepath") or "").replace("\\", "/"))
+    return posixpath.join(night_dir, basename)
+
+
+def _composite_key_for_raw(raw_key: str) -> str:
+    return posixpath.splitext(raw_key)[0] + RECONSTRUCT_EXT
+
+
+def _create_reconstructed_source_image(
+    project: Project,
+    deployment: Deployment,
+    data: dict,
+    json_key: str,
+    reconstruct: "ReconstructionContext",
+    summary: ImportSummary,
+) -> SourceImage:
+    """Get/create a placeholder-free reconstructed capture: build+upload the composite (once),
+    then a SourceImage pointing at it via the reconstructed bucket's ``public_base_url``."""
+    from ami.utils.dates import get_image_timestamp_from_filename
+
+    composite_key = _composite_key_for_raw(_raw_object_key_for_json(json_key, data))
+    existing = SourceImage.objects.filter(deployment=deployment, path=composite_key).first()
+    if existing is not None:
+        return existing  # already imported — composite assumed present (idempotent re-run)
+
+    if not reconstruct.dry_run:
+        _upload_composite(data, json_key, reconstruct, composite_key)
+
+    source_image = SourceImage.objects.create(
+        deployment=deployment,
+        path=composite_key,
+        project=project,
+        public_base_url=reconstruct.write_source.public_base_url,
+        width=_to_int(data.get("imageWidth")),
+        height=_to_int(data.get("imageHeight")),
+        timestamp=get_image_timestamp_from_filename(composite_key),
+    )
+    summary.reconstructed_created += 1
+    return source_image
+
+
+def _upload_composite(data: dict, json_key: str, reconstruct: "ReconstructionContext", composite_key: str) -> None:
+    """Build the composite (unless already in the bucket) and upload it as image/webp."""
+    import ami.utils.s3 as s3
+
+    write_cfg = reconstruct.write_source.config
+    if s3.file_exists(write_cfg, composite_key):
+        return
+    composite = reconstruct_composite_webp(
+        data,
+        json_key,
+        read_patch=lambda key: s3.read_file(reconstruct.read_config, key),
+        quality=reconstruct.quality,
+        scale=reconstruct.scale,
+    )
+    # write_file() doesn't set a content type; put directly so the .webp serves as image/webp.
+    bucket = s3.get_bucket(write_cfg)
+    bucket.Object(s3.key_with_prefix(write_cfg, composite_key)).put(Body=composite, ContentType="image/webp")
+    logger.info(f"Reconstructed + uploaded composite {composite_key} ({len(composite) / 1e6:.2f} MB)")
+
+
+def _to_int(value: typing.Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------------------
 def import_records(
@@ -419,30 +589,44 @@ def import_records(
     summary: ImportSummary | None = None,
     unidentified_taxon: Taxon | None = None,
     shim_algorithm: Algorithm | None = None,
+    reconstruct: "ReconstructionContext | None" = None,
 ) -> ImportSummary:
     """Import an iterable of parsed ``_botdetection.json`` dicts into an already-synced project.
 
-    Each record must be matched to an existing ``SourceImage`` (by raw-image filename within
-    the record's deployment) — images whose raw frame was not registered are logged and
-    skipped (the "raw present only" guard). Occurrences + determinations are created at the end
-    via Antenna's own bulk helper.
+    Each record is matched to an existing ``SourceImage`` by raw-image filename. If the raw frame
+    wasn't registered: when ``reconstruct`` is given, a composite capture is built from the patches
+    (see ``ReconstructionContext``); otherwise the record is skipped (the "raw present only" guard).
+    Occurrences + determinations are created at the end via Antenna's own bulk helper.
 
     If ``unidentified_taxon`` is given, unclassified detections get a shim classification to it
     (score ``SHIM_SCORE``); their occurrences are then determined as that taxon with score 0.0.
+    Matched (real, raw-present) captures are added to the project's "Real captures" collection.
     """
     from ami.ml.models.pipeline import create_and_update_occurrences_for_detections
 
     summary = summary or ImportSummary()
     taxon_cache: dict[tuple[str, str], Taxon] = {}
     all_detections: list[Detection] = []
+    real_source_images: list[SourceImage] = []
+    deployment_cache: dict[str, Deployment] = {}
 
     for data in json_records:
         summary.json_files_read += 1
         source_image = _match_source_image(project, data)
         if source_image is None:
-            summary.source_images_skipped_no_capture += 1
-            continue
-        summary.source_images_matched += 1
+            if reconstruct is None:
+                summary.source_images_skipped_no_capture += 1
+                continue
+            deployment = _resolve_deployment(project, data, deployment_cache)
+            if deployment is None:
+                summary.source_images_skipped_no_capture += 1
+                continue
+            source_image = _create_reconstructed_source_image(
+                project, deployment, data, data["_json_key"], reconstruct, summary
+            )
+        else:
+            summary.source_images_matched += 1
+            real_source_images.append(source_image)
         detections = import_detections_for_image(
             data, source_image, detector, classifier, taxon_cache, summary, unidentified_taxon, shim_algorithm
         )
@@ -453,9 +637,54 @@ def import_records(
         summary.occurrences_created += len(all_detections)
 
     _fix_shim_determination_scores(project, unidentified_taxon)
+    _add_to_real_captures_collection(project, real_source_images)
 
     logger.info(f"Mothbox import summary: {summary.as_dict()}")
     return summary
+
+
+def _resolve_deployment(project: Project, data: dict, cache: dict[str, Deployment]) -> Deployment | None:
+    name = (data.get("deployment_name") or "").strip()
+    if not name:
+        return None
+    if name not in cache:
+        cache[name] = Deployment.objects.filter(project=project, name=name).first()
+    return cache[name]
+
+
+def get_or_create_real_captures_collection(project: Project):
+    """The manual capture set that lets users filter to only real (raw-present) captures."""
+    from ami.main.models import SourceImageCollection
+
+    collection, _ = SourceImageCollection.objects.get_or_create(
+        project=project, name=REAL_CAPTURES_COLLECTION_NAME, defaults={"method": "manual"}
+    )
+    return collection
+
+
+def _add_to_real_captures_collection(project: Project, source_images: list[SourceImage]) -> None:
+    if source_images:
+        get_or_create_real_captures_collection(project).images.add(*source_images)
+
+
+def backfill_real_captures_collection(
+    project: Project, batch_size: int = 5000, logger: logging.Logger = logger
+) -> int:
+    """Add all existing real (raw-present) captures in ``project`` to the "Real captures" set.
+
+    Reconstructed captures are excluded by their ``.webp`` path (only reconstruction writes those).
+    Run once before/after enabling reconstruction; the importer keeps the set current thereafter.
+    """
+    collection = get_or_create_real_captures_collection(project)
+    ids = list(
+        SourceImage.objects.filter(project=project)
+        .exclude(path__endswith=RECONSTRUCT_EXT)
+        .values_list("pk", flat=True)
+    )
+    for i in range(0, len(ids), batch_size):
+        collection.images.add(*ids[i : i + batch_size])
+    logger.info(f"Added {len(ids)} real captures to '{collection.name}' for {project}")
+    return len(ids)
 
 
 def _fix_shim_determination_scores(project: Project, unidentified_taxon: Taxon | None) -> None:
@@ -561,6 +790,7 @@ def import_from_s3(
     regex: str = r"_HDR0\.jpg$",
     skip_sync: bool = False,
     unidentified_taxon_name: str | None = DEFAULT_UNIDENTIFIED_TAXON,
+    reconstruct: "ReconstructionContext | None" = None,
     logger: logging.Logger = logger,
 ) -> ImportSummary:
     """End-to-end import of all ``*_botdetection.json`` under ``prefix`` in an S3 source.
@@ -572,6 +802,9 @@ def import_from_s3(
     ``unidentified_taxon_name`` (default ``"Arthropoda"``) gives detections Mothbot_Process left
     unclassified a shim classification to that taxon at score 0.0; pass ``None``/`""` to leave
     them determination-less instead.
+
+    ``reconstruct`` (a ``ReconstructionContext``) enables importing captures whose raw frame was
+    deleted: a grey composite is built from the patches and uploaded to the reconstructed bucket.
     """
     import ami.utils.s3 as s3
 
@@ -593,7 +826,9 @@ def import_from_s3(
     records: list[tuple[str, dict]] = []
     for key in json_keys:
         try:
-            records.append((key, json.loads(s3.read_file(config, key).decode("utf-8"))))
+            data = json.loads(s3.read_file(config, key).decode("utf-8"))
+            data["_json_key"] = key  # reconstruction needs the key to locate patches + the raw key
+            records.append((key, data))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             logger.warning(f"Skipping unreadable JSON {key}: {exc}")
 
@@ -640,7 +875,17 @@ def import_from_s3(
             summary=summary,
             unidentified_taxon=unidentified_taxon,
             shim_algorithm=shim_algorithm,
+            reconstruct=reconstruct,
         )
+
+    # Reconstructed captures are created directly (not via sync_captures), so regroup events to
+    # give them an Event and interleave them by timestamp with the real captures — must run
+    # before recompute_calculated_fields (which iterates deployment.events).
+    if reconstruct is not None:
+        from ami.main.models import group_images_into_events
+
+        for deployment in deployments.values():
+            group_images_into_events(deployment)
 
     # Recompute cached counts once, after all detections/occurrences exist. sync_captures
     # runs before occurrences are created, so the deployment/event count fields would
