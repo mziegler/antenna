@@ -250,8 +250,10 @@ def provision_deployment(
 ) -> Deployment:
     """Get/create the Project + Deployment (+ Site, Device) from a JSON's top-level metadata.
 
-    Keyed on ``deployment_name``. Sets lat/lon, research site and device, and — when a data
-    source is given — the S3 sync settings so ``sync_captures`` can register the raw frames.
+    Matches an existing deployment by its **Mothbox codename** (the S3 folder, stored in
+    ``data_source_subdir``) rather than by ``name`` — so renaming a deployment's display name in
+    the Antenna UI does NOT make the importer create a duplicate. Sets lat/lon, research site and
+    device, and — when a data source is given — the S3 sync settings for ``sync_captures``.
     """
     project_name = (metadata.get("project") or "Mothbox").strip()
     deployment_name = (metadata.get("deployment_name") or "").strip()
@@ -270,24 +272,30 @@ def provision_deployment(
     if device_name:
         device, _ = Device.objects.get_or_create(name=device_name, project=project)
 
-    deployment, created = Deployment.objects.get_or_create(
-        name=deployment_name,
-        project=project,
-        defaults={
-            "latitude": _to_float(metadata.get("latitude")),
-            "longitude": _to_float(metadata.get("longitude")),
-            "research_site": site,
-            "device": device,
-            "description": _deployment_description(metadata),
-        },
+    # Match by the Mothbox codename (data_source_subdir), then fall back to name for deployments
+    # created before subdir-matching existed; create only if neither is found.
+    subdir = data_source_subdir if data_source_subdir is not None else deployment_name
+    deployment = (
+        Deployment.objects.filter(project=project, data_source_subdir=subdir).first()
+        or Deployment.objects.filter(project=project, name=deployment_name).first()
     )
+    created = deployment is None
+    if created:
+        deployment = Deployment.objects.create(
+            name=deployment_name,
+            project=project,
+            latitude=_to_float(metadata.get("latitude")),
+            longitude=_to_float(metadata.get("longitude")),
+            research_site=site,
+            device=device,
+            description=_deployment_description(metadata),
+        )
 
     # Backfill S3 sync settings (idempotent) so the deployment can pull its raw frames.
     updated_fields: list[str] = []
     if data_source is not None and deployment.data_source_id != data_source.pk:
         deployment.data_source = data_source
         updated_fields.append("data_source")
-    subdir = data_source_subdir if data_source_subdir is not None else deployment_name
     if deployment.data_source_subdir != subdir:
         deployment.data_source_subdir = subdir
         updated_fields.append("data_source_subdir")

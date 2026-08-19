@@ -8,6 +8,7 @@ from PIL import Image
 
 from ami.main.models import (
     Classification,
+    Deployment,
     Detection,
     Occurrence,
     S3StorageSource,
@@ -195,6 +196,19 @@ class MothboxImportTest(TestCase):
         # Re-provisioning is idempotent (no duplicate deployment).
         again = mb.provision_deployment(_botdetection_json())
         self.assertEqual(again.pk, deployment.pk)
+
+    def test_provision_matches_renamed_deployment_by_codename(self):
+        # Import creates the deployment, then a user renames its display name in Antenna.
+        deployment = mb.provision_deployment(_botdetection_json())
+        codename = deployment.data_source_subdir
+        deployment.name = "RestorationNewerC: full brightness"
+        deployment.save()
+        # A re-import of the same Mothbox data (same codename) must re-link to the renamed
+        # deployment by data_source_subdir, not create a duplicate — and keep the friendly name.
+        again = mb.provision_deployment(_botdetection_json())
+        self.assertEqual(again.pk, deployment.pk)
+        self.assertEqual(again.name, "RestorationNewerC: full brightness")
+        self.assertEqual(Deployment.objects.filter(project=deployment.project, data_source_subdir=codename).count(), 1)
 
     def test_reconstruct_missing_raw_creates_composite_capture(self):
         write_source = S3StorageSource.objects.create(
