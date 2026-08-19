@@ -656,7 +656,13 @@ def _resolve_deployment(project: Project, data: dict, cache: dict[str, Deploymen
     if not name:
         return None
     if name not in cache:
-        cache[name] = Deployment.objects.filter(project=project, name=name).first()
+        # Match by the Mothbox codename (data_source_subdir) first — like provision_deployment —
+        # so a deployment renamed in the Antenna UI is still found (matching by name would miss it
+        # and wrongly skip the capture as "no raw"). Fall back to name for older deployments.
+        cache[name] = (
+            Deployment.objects.filter(project=project, data_source_subdir=name).first()
+            or Deployment.objects.filter(project=project, name=name).first()
+        )
     return cache[name]
 
 

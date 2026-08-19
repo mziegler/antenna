@@ -243,6 +243,37 @@ class MothboxImportTest(TestCase):
         self.assertEqual(summary2.reconstructed_created, 0)
         self.assertEqual(SourceImage.objects.filter(deployment=self.deployment, path__endswith=".webp").count(), 1)
 
+    def test_reconstruct_resolves_renamed_deployment_by_codename(self):
+        # Reproduces the field bug: a deployment renamed in the Antenna UI keeps its Mothbox
+        # codename in data_source_subdir, but the JSON still carries the codename as
+        # deployment_name. _resolve_deployment must match by codename, or missing-raw captures
+        # are wrongly skipped as "no capture" instead of reconstructed.
+        codename = "Dataset_ManuNet_RestorationNewerC_fluidRobin_2026-05-04"
+        self.deployment.data_source_subdir = codename
+        self.deployment.name = "RestorationNewerC: full brightness"
+        self.deployment.save()
+
+        write_source = S3StorageSource.objects.create(
+            name="recon2",
+            bucket="recon-bucket",
+            access_key="",
+            secret_key="",
+            public_base_url="https://obj.example.com/recon/",
+        )
+        ctx = mb.ReconstructionContext(read_config=None, write_source=write_source, dry_run=True)
+        rec = _botdetection_json()
+        rec["deployment_name"] = codename  # the source data keeps the ugly codename
+        rec["imagePath"] = "/mb/2026-05-17/RECON_2026_05_17__19_00_00_HDR0.jpg"  # no matching raw
+        rec[
+            "_json_key"
+        ] = "manu-net-deployments/D/2026-05-17/_processed/RECON_2026_05_17__19_00_00_HDR0_botdetection.json"
+
+        summary = mb.import_records(self.project, self.detector, self.classifier, [rec], reconstruct=ctx)
+
+        self.assertEqual(summary.reconstructed_created, 1)
+        self.assertEqual(summary.source_images_skipped_no_capture, 0)
+        self.assertEqual(SourceImage.objects.filter(deployment=self.deployment, path__endswith=".webp").count(), 1)
+
     def test_real_captures_collection_gets_matched_captures(self):
         mb.import_records(self.project, self.detector, self.classifier, [_botdetection_json()])
         coll = SourceImageCollection.objects.get(project=self.project, name=mb.REAL_CAPTURES_COLLECTION_NAME)
